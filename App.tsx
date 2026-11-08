@@ -384,6 +384,7 @@ export default function App() {
 
               if (!measurement) {
                 angleSamples = [];
+                stableState = null;
                 candidateState = null;
                 candidateFrames = 0;
                 setWristAngle(null);
@@ -535,7 +536,7 @@ export default function App() {
         ) : cameraPermission?.granted ? (
           <View style={styles.cameraPreviewContainer}>
             <CameraView facing="front" style={styles.cameraVideo} />
-            <View style={[styles.poseReadout, styles.poseReadoutBent]}>
+            <View style={[styles.poseReadout, poseState === 'bent' && styles.poseReadoutBent]}>
               <Text style={styles.poseReadoutTitle}>{poseLabels[poseState]}</Text>
               <Text style={styles.poseReadoutDetail}>Haltungserkennung ist im Browser verfügbar</Text>
             </View>
