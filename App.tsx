@@ -69,6 +69,86 @@ function estimatePitch(buffer: Float32Array, sampleRate: number): number {
   return sampleRate / bestOffset;
 }
 
+type LandmarkPoint = {
+  x: number;
+  y: number;
+  visibility?: number;
+  presence?: number;
+};
+
+type WristMeasurement = {
+  angle: number;
+  side: 'links' | 'rechts';
+};
+
+function measureWristAngle(
+  pose: LandmarkPoint[],
+  hands: LandmarkPoint[][],
+  videoWidth: number,
+  videoHeight: number,
+): WristMeasurement | null {
+  const arms = [
+    { side: 'links' as const, elbow: 13, wrist: 15 },
+    { side: 'rechts' as const, elbow: 14, wrist: 16 },
+  ];
+  const diagonal = Math.hypot(videoWidth, videoHeight);
+  let best: WristMeasurement | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const arm of arms) {
+    const elbow = pose[arm.elbow];
+    const wrist = pose[arm.wrist];
+    const confidence = Math.min(
+      elbow?.visibility ?? elbow?.presence ?? 1,
+      wrist?.visibility ?? wrist?.presence ?? 1,
+    );
+
+    if (!elbow || !wrist || confidence < 0.45) {
+      continue;
+    }
+
+    for (const hand of hands) {
+      const handWrist = hand[0];
+      const middleKnuckle = hand[9];
+      if (!handWrist || !middleKnuckle) {
+        continue;
+      }
+
+      const distance = Math.hypot(
+        (wrist.x - handWrist.x) * videoWidth,
+        (wrist.y - handWrist.y) * videoHeight,
+      ) / diagonal;
+      if (distance > 0.16 || distance >= bestDistance) {
+        continue;
+      }
+
+      const forearmX = (wrist.x - elbow.x) * videoWidth;
+      const forearmY = (wrist.y - elbow.y) * videoHeight;
+      const palmX = (middleKnuckle.x - handWrist.x) * videoWidth;
+      const palmY = (middleKnuckle.y - handWrist.y) * videoHeight;
+      const forearmLength = Math.hypot(forearmX, forearmY);
+      const palmLength = Math.hypot(palmX, palmY);
+      if (forearmLength < 1 || palmLength < 1) {
+        continue;
+      }
+
+      const cosine = Math.max(-1, Math.min(1, (forearmX * palmX + forearmY * palmY) / (forearmLength * palmLength)));
+      best = { angle: Math.round(Math.acos(cosine) * (180 / Math.PI)), side: arm.side };
+      bestDistance = distance;
+    }
+  }
+
+  return best;
+}
+
+type PoseState = 'idle' | 'loading' | 'searching' | 'straight' | 'bent' | 'unsupported' | 'error';
+type MediaPipeVisionModule = typeof import('@mediapipe/tasks-vision');
+
+const loadMediaPipeVision = new Function(
+  'moduleUrl',
+  'return import(moduleUrl)',
+) as (moduleUrl: string) => Promise<MediaPipeVisionModule>;
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('Dashboard');
   const [selectedString, setSelectedString] = useState<string>('A');
@@ -78,17 +158,54 @@ export default function App() {
   const [detectedPitch, setDetectedPitch] = useState<number>(440);
   const [detectedNote, setDetectedNote] = useState<string>('A');
   const [detectedCents, setDetectedCents] = useState<number>(0);
-  const [poseStatus, setPoseStatus] = useState<string>('Violine erkannt');
+  const [poseState, setPoseState] = useState<PoseState>('idle');
+  const [wristAngle, setWristAngle] = useState<number | null>(null);
+  const [wristSide, setWristSide] = useState<'links' | 'rechts' | null>(null);
   const [webCameraStream, setWebCameraStream] = useState<MediaStream | null>(null);
-  const cameraVideoRef = useRef<any>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const poseAnimationFrameRef = useRef<number | null>(null);
+  const selectedTargetRef = useRef<number>(strings[2].target);
+  const poseStateRef = useRef<PoseState>('idle');
 
   const selectedStringData = useMemo(
     () => strings.find((item) => item.name === selectedString) ?? strings[2],
     [selectedString],
   );
+
+  useEffect(() => {
+    selectedTargetRef.current = selectedStringData.target;
+  }, [selectedStringData.target]);
+
+  const updatePoseState = (nextState: PoseState) => {
+    const previousState = poseStateRef.current;
+    if (previousState === nextState) {
+      return;
+    }
+
+    poseStateRef.current = nextState;
+    setPoseState(nextState);
+
+    if (nextState === 'bent' && previousState !== 'bent') {
+      const context = audioContextRef.current;
+      if (context?.state === 'running') {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const startAt = context.currentTime;
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(740, startAt);
+        gain.gain.setValueAtTime(0.0001, startAt);
+        gain.gain.exponentialRampToValueAtTime(0.12, startAt + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.22);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(startAt);
+        oscillator.stop(startAt + 0.23);
+      }
+    }
+  };
 
   useEffect(() => {
     if (Platform.OS !== 'web' && cameraPermission && !cameraPermission.granted && cameraPermission.canAskAgain) {
@@ -99,98 +216,259 @@ export default function App() {
   useEffect(() => {
     if (Platform.OS === 'web' && webCameraStream && cameraVideoRef.current) {
       cameraVideoRef.current.srcObject = webCameraStream;
-      cameraVideoRef.current.play();
+      void cameraVideoRef.current.play().catch((error) => {
+        console.warn('Kameravorschau konnte nicht gestartet werden:', error);
+      });
     }
   }, [webCameraStream]);
 
   useEffect(() => {
-    if (Platform.OS !== 'web') {
+    if (Platform.OS !== 'web' || !webCameraStream || !audioContextRef.current) {
       return;
     }
 
-    const startWebCamera = async () => {
-      if (!navigator.mediaDevices?.getUserMedia) {
+    const audioContext = audioContextRef.current;
+    const source = audioContext.createMediaStreamSource(webCameraStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.2;
+    source.connect(analyser);
+    analyserRef.current = analyser;
+
+    const tick = () => {
+      const currentAnalyser = analyserRef.current;
+      if (!currentAnalyser) {
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user' },
-        audio: true,
-      });
+      const buffer = new Float32Array(currentAnalyser.fftSize);
+      currentAnalyser.getFloatTimeDomainData(buffer);
+      const pitch = estimatePitch(buffer, audioContext.sampleRate);
 
-      setWebCameraStream(stream);
+      if (pitch > 60 && pitch < 1200) {
+        setDetectedPitch(pitch);
+        setDetectedNote(frequencyToNoteName(pitch));
+        setDetectedCents(frequencyToCents(pitch, selectedTargetRef.current));
+      }
 
-      const audioContext = new AudioContext();
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0.2;
-      source.connect(analyser);
-
-      audioContextRef.current = audioContext;
-      analyserRef.current = analyser;
-      setMicPermission(true);
-      setMicEnabled(true);
-
-      const tick = () => {
-        const currentAnalyser = analyserRef.current;
-        if (!currentAnalyser) {
-          return;
-        }
-
-        const buffer = new Float32Array(currentAnalyser.fftSize);
-        currentAnalyser.getFloatTimeDomainData(buffer);
-        const pitch = estimatePitch(buffer, audioContext.sampleRate);
-
-        if (pitch > 60 && pitch < 1200) {
-          setDetectedPitch(pitch);
-          setDetectedNote(frequencyToNoteName(pitch));
-          setDetectedCents(frequencyToCents(pitch, selectedStringData.target));
-        }
-
-        animationFrameRef.current = requestAnimationFrame(tick);
-      };
-
-      tick();
+      animationFrameRef.current = requestAnimationFrame(tick);
     };
 
-    startWebCamera();
+    tick();
 
     return () => {
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      if (webCameraStream) {
-        webCameraStream.getTracks().forEach((track) => track.stop());
-      }
+      source.disconnect();
+      analyserRef.current = null;
+      void audioContext.close();
+      audioContextRef.current = null;
+      webCameraStream.getTracks().forEach((track) => track.stop());
     };
-  }, [selectedStringData.target]);
+  }, [webCameraStream]);
 
   useEffect(() => {
-    if (Platform.OS === 'web') {
-      const status = Math.abs(detectedCents) < 8 ? 'Violine erkannt · korrekt' : Math.abs(detectedCents) < 25 ? 'Violine erkannt · leicht daneben' : 'Violine erkannt · deutlich daneben';
-      setPoseStatus(status);
+    if (Platform.OS !== 'web') {
+      updatePoseState('unsupported');
+      return;
     }
-  }, [detectedCents]);
+
+    if (!webCameraStream) {
+      return;
+    }
+
+    let active = true;
+    let poseLandmarker: import('@mediapipe/tasks-vision').PoseLandmarker | null = null;
+    let handLandmarker: import('@mediapipe/tasks-vision').HandLandmarker | null = null;
+    let lastVideoTime = -1;
+    let lastDetectionAt = 0;
+    let stableState: 'straight' | 'bent' | null = null;
+    let candidateState: 'straight' | 'bent' | null = null;
+    let candidateFrames = 0;
+    let angleSamples: number[] = [];
+
+    const setState = (nextState: PoseState) => {
+      if (active) {
+        updatePoseState(nextState);
+      }
+    };
+
+    const startDetection = async () => {
+      setState('loading');
+
+      try {
+        const { FilesetResolver, PoseLandmarker, HandLandmarker } = await loadMediaPipeVision(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2/vision_bundle.mjs',
+        );
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2/wasm',
+        );
+        const poseOptions = {
+          runningMode: 'VIDEO' as const,
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.55,
+          minPosePresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55,
+        };
+        const handOptions = {
+          runningMode: 'VIDEO' as const,
+          numHands: 2,
+          minHandDetectionConfidence: 0.55,
+          minHandPresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55,
+        };
+
+        const createLandmarkers = async (delegate: 'GPU' | 'CPU') => {
+          let pose: Awaited<ReturnType<typeof PoseLandmarker.createFromOptions>> | null = null;
+          try {
+            pose = await PoseLandmarker.createFromOptions(vision, {
+              ...poseOptions,
+              baseOptions: {
+                modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
+                delegate,
+              },
+            });
+            const hand = await HandLandmarker.createFromOptions(vision, {
+              ...handOptions,
+              baseOptions: {
+                modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task',
+                delegate,
+              },
+            });
+            return { pose, hand };
+          } catch (error) {
+            pose?.close();
+            throw error;
+          }
+        };
+
+        let landmarkers: Awaited<ReturnType<typeof createLandmarkers>>;
+        try {
+          landmarkers = await createLandmarkers('GPU');
+        } catch {
+          landmarkers = await createLandmarkers('CPU');
+        }
+
+        if (!active) {
+          landmarkers.pose.close();
+          landmarkers.hand.close();
+          return;
+        }
+
+        poseLandmarker = landmarkers.pose;
+        handLandmarker = landmarkers.hand;
+
+        const detectFrame = () => {
+          if (!active || !poseLandmarker || !handLandmarker) {
+            return;
+          }
+
+          const video = cameraVideoRef.current;
+          if (video && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+            const now = performance.now();
+            if (now - lastDetectionAt >= 100) {
+              lastVideoTime = video.currentTime;
+              lastDetectionAt = now;
+
+              const poseResult = poseLandmarker.detectForVideo(video, now);
+              const handResult = handLandmarker.detectForVideo(video, now);
+              const measurement = poseResult.landmarks[0]
+                ? measureWristAngle(
+                    poseResult.landmarks[0],
+                    handResult.landmarks,
+                    video.videoWidth,
+                    video.videoHeight,
+                  )
+                : null;
+
+              if (!measurement) {
+                angleSamples = [];
+                candidateState = null;
+                candidateFrames = 0;
+                setWristAngle(null);
+                setWristSide(null);
+                setState('searching');
+              } else {
+                angleSamples = [...angleSamples.slice(-4), measurement.angle];
+                const sortedAngles = [...angleSamples].sort((a, b) => a - b);
+                const smoothedAngle = sortedAngles[Math.floor(sortedAngles.length / 2)];
+                setWristAngle(smoothedAngle);
+                setWristSide(measurement.side);
+
+                const nextState = stableState === null
+                  ? smoothedAngle >= 28 ? 'bent' : 'straight'
+                  : smoothedAngle >= 34 ? 'bent' : smoothedAngle <= 22 ? 'straight' : stableState;
+
+                if (nextState === stableState) {
+                  candidateState = null;
+                  candidateFrames = 0;
+                } else if (candidateState === nextState) {
+                  candidateFrames += 1;
+                } else {
+                  candidateState = nextState;
+                  candidateFrames = 1;
+                }
+
+                if (candidateFrames >= 4) {
+                  stableState = nextState;
+                  candidateState = null;
+                  candidateFrames = 0;
+                  setState(nextState);
+                }
+              }
+            }
+          }
+
+          poseAnimationFrameRef.current = requestAnimationFrame(detectFrame);
+        };
+
+        setState('searching');
+        detectFrame();
+      } catch (error) {
+        console.warn('Handgelenk-Erkennung konnte nicht gestartet werden:', error);
+        setState('error');
+      }
+    };
+
+    void startDetection();
+
+    return () => {
+      active = false;
+      if (poseAnimationFrameRef.current !== null) {
+        cancelAnimationFrame(poseAnimationFrameRef.current);
+      }
+      poseLandmarker?.close();
+      handLandmarker?.close();
+    };
+  }, [webCameraStream]);
 
   const handleCameraPermissionRequest = async () => {
     if (Platform.OS === 'web') {
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
+          updatePoseState('error');
           return;
         }
+
+        const audioContext = new window.AudioContext();
+        audioContextRef.current = audioContext;
+        await audioContext.resume();
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: 'user' },
-          audio: true,
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
         });
         setWebCameraStream(stream);
         setMicPermission(true);
         setMicEnabled(true);
+        updatePoseState('loading');
       } catch (error) {
         console.warn('Kamera-/Mikrofonzugriff fehlgeschlagen:', error);
+        updatePoseState('error');
+        if (audioContextRef.current) {
+          void audioContextRef.current.close();
+          audioContextRef.current = null;
+        }
       }
       return;
     }
@@ -206,6 +484,15 @@ export default function App() {
   const liveTarget = selectedStringData.target;
   const liveDelta = detectedPitch > 0 ? detectedCents : 0;
   const tuningState = Math.abs(liveDelta) <= 8 ? 'perfekt' : Math.abs(liveDelta) <= 25 ? 'leicht daneben' : 'deutlich daneben';
+  const poseLabels: Record<PoseState, string> = {
+    idle: 'Kamera nicht gestartet',
+    loading: 'Erkennung lädt',
+    searching: 'Handgelenk suchen',
+    straight: 'Handgelenk gerade',
+    bent: 'Handgelenk gekrümmt',
+    unsupported: 'Haltungserkennung im Browser',
+    error: 'Erkennung nicht verfügbar',
+  };
 
   const renderDashboard = () => (
     <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
@@ -220,7 +507,7 @@ export default function App() {
       <View style={styles.cameraCard}>
         <View style={styles.panelHeader}>
           <Text style={styles.panelTitle}>Live-Kameraanalyse</Text>
-          {Platform.OS === 'web' || cameraPermission?.granted ? (
+          {(Platform.OS === 'web' ? Boolean(webCameraStream) : cameraPermission?.granted) ? (
             <Text style={[styles.badge, { backgroundColor: '#dffaf0', color: '#1a9b6d' }]}>Aktiv</Text>
           ) : (
             <TouchableOpacity onPress={handleCameraPermissionRequest} style={styles.permissionButton}>
@@ -233,11 +520,11 @@ export default function App() {
           webCameraStream ? (
             <View style={styles.cameraPreviewContainer}>
               <video ref={cameraVideoRef} autoPlay muted playsInline style={styles.cameraVideo} />
-              <View style={styles.poseBox}>
-                <View style={styles.poseLineOne} />
-                <View style={styles.poseLineTwo} />
-                <View style={styles.poseLineThree} />
-                <View style={styles.poseDot} />
+              <View style={[styles.poseReadout, poseState === 'bent' && styles.poseReadoutBent]}>
+                <Text style={styles.poseReadoutTitle}>{poseLabels[poseState]}</Text>
+                <Text style={styles.poseReadoutDetail}>
+                  {wristAngle === null ? 'Arm und Hand im Bild halten' : `${wristSide} · ${wristAngle}°`}
+                </Text>
               </View>
             </View>
           ) : (
@@ -248,11 +535,9 @@ export default function App() {
         ) : cameraPermission?.granted ? (
           <View style={styles.cameraPreviewContainer}>
             <CameraView facing="front" style={styles.cameraVideo} />
-            <View style={styles.poseBox}>
-              <View style={styles.poseLineOne} />
-              <View style={styles.poseLineTwo} />
-              <View style={styles.poseLineThree} />
-              <View style={styles.poseDot} />
+            <View style={[styles.poseReadout, styles.poseReadoutBent]}>
+              <Text style={styles.poseReadoutTitle}>{poseLabels[poseState]}</Text>
+              <Text style={styles.poseReadoutDetail}>Haltungserkennung ist im Browser verfügbar</Text>
             </View>
           </View>
         ) : (
@@ -264,7 +549,7 @@ export default function App() {
 
       <View style={styles.metricGrid}>
         <View style={styles.metricCard}>
-          <Text style={styles.metricTone}>{poseStatus}</Text>
+          <Text style={styles.metricTone}>{poseLabels[poseState]}</Text>
           <Text style={styles.metricLabel}>Haltung</Text>
         </View>
         <View style={styles.metricCard}>
@@ -557,50 +842,29 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: '#0f172a',
   },
-  poseBox: {
+  poseReadout: {
     position: 'absolute',
-    left: '10%',
-    right: '10%',
-    top: '10%',
-    bottom: '10%',
-    borderWidth: 2,
-    borderColor: '#5d7cff',
-    borderRadius: 18,
+    left: 12,
+    right: 12,
+    bottom: 12,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: 'rgba(17, 24, 39, 0.88)',
   },
-  poseLineOne: {
-    position: 'absolute',
-    width: '100%',
-    height: 2,
-    backgroundColor: '#5d7cff',
-    top: '50%',
+  poseReadoutBent: {
+    backgroundColor: 'rgba(146, 36, 34, 0.92)',
   },
-  poseLineTwo: {
-    position: 'absolute',
-    width: 2,
-    height: '100%',
-    backgroundColor: '#5d7cff',
-    left: '50%',
+  poseReadoutTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '800',
   },
-  poseLineThree: {
-    position: 'absolute',
-    width: 70,
-    height: 70,
-    borderRadius: 35,
-    borderWidth: 2,
-    borderColor: '#5d7cff',
-    left: '50%',
-    top: '50%',
-    marginLeft: -35,
-    marginTop: -35,
-  },
-  poseDot: {
-    position: 'absolute',
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#38d39f',
-    left: '52%',
-    top: '52%',
+  poseReadoutDetail: {
+    marginTop: 2,
+    color: '#f3f4f6',
+    fontSize: 13,
+    fontWeight: '600',
   },
   cameraPlaceholder: {
     color: '#465264',
